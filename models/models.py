@@ -18,6 +18,7 @@ import torch.nn as nn
 from models.base_models import MLPBase, LSTMBase, GRUBase
 from models.model_transformer import GPT, GPTConfig
 from models.mamba import Mamba, MambaConfig
+from models.jamba import Jamba, JambaConfig
 from utils.running_mean_std import RunningMeanStd
 
 class MLPDeterministic(nn.Module):
@@ -104,14 +105,22 @@ class ModelMixedInput(nn.Module):
             self.is_rnn = False
             self.rnn = None
 
-        if novelty == 'mamba':
+        if novelty in ['mamba', 'mamba-3', 'mamba-6']:
             self.is_transformer = False
             self.transformer_model = None
+            
+            # Determine layer count based on novelty type
+            if novelty == 'mamba-3':
+                n_layer = 3
+            elif novelty == 'mamba-6':
+                n_layer = 6
+            else:  # 'mamba' defaults to 6 for backward compatibility
+                n_layer = network_cfg['transformer']['n_layer']
             
             # Use transformer config for mamba for now, or add specific mamba config
             mamba_cfg = MambaConfig(
                 d_model=network_cfg['transformer']['n_embd'],
-                n_layer=network_cfg['transformer']['n_layer'],
+                n_layer=n_layer,
                 d_state=16, # Default
                 expand=2,   # Default
                 vocab_size=self.feature_dim,
@@ -120,6 +129,32 @@ class ModelMixedInput(nn.Module):
             self.mamba_model.to(self.device)
             self.is_mamba = True
             self.feature_dim = mamba_cfg.d_model
+
+        elif novelty == 'jamba':
+            self.is_transformer = False
+            self.transformer_model = None
+            self.mamba_model = None
+            self.is_mamba = False
+            
+            # Use transformer config for jamba for now, or add specific jamba config
+            # We divide n_layer by 3 because each JambaBlock has 3 layers (mmt)
+            jamba_n_layer = max(1, network_cfg['transformer']['n_layer'] // 3)
+            jamba_cfg = JambaConfig(
+                d_model=network_cfg['transformer']['n_embd'],
+                n_layer=jamba_n_layer, # This will be number of JambaBlocks
+                vocab_size=self.feature_dim,
+                n_head=network_cfg['transformer']['n_head'],
+                block_size=network_cfg['transformer']['block_size'],
+                dropout=network_cfg['transformer']['dropout'],
+                bias=network_cfg['transformer']['bias'],
+                # Mamba params
+                d_state=16,
+                expand=2,
+            )
+            self.jamba_model = Jamba(jamba_cfg)
+            self.jamba_model.to(self.device)
+            self.is_jamba = True
+            self.feature_dim = jamba_cfg.d_model
             
         elif "transformer" in network_cfg:
             model_args = dict(
@@ -143,6 +178,7 @@ class ModelMixedInput(nn.Module):
             self.is_transformer = False
             self.transformer_model = None
             self.is_mamba = False
+            self.is_jamba = False
 
         if self.model is None:
             self.model = MLPDeterministic(
@@ -228,6 +264,9 @@ class ModelMixedInput(nn.Module):
             
         if self.is_mamba:
             features = self.mamba_model(features)
+
+        if getattr(self, 'is_jamba', False):
+            features = self.jamba_model(features)
                     
         output = self.model(features, deterministic = deterministic)
 
@@ -262,6 +301,9 @@ class ModelMixedInput(nn.Module):
         if self.is_mamba:
             features = self.mamba_model(features)
 
+        if getattr(self, 'is_jamba', False):
+            features = self.jamba_model(features)
+
         B, T, feature_dim = features.shape
         features_flatten = features.contiguous().view(-1, feature_dim)
         output_flatten = self.model(features_flatten, deterministic = deterministic)
@@ -290,6 +332,8 @@ class ModelMixedInput(nn.Module):
             encoder.to(device)
         if self.rnn is not None:
             self.rnn.to(device)
+        if getattr(self, 'is_jamba', False):
+            self.jamba_model.to(device)
         self.model.to(device)
 
     def init_rnn(self, batch_size):
